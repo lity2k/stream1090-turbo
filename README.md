@@ -21,8 +21,10 @@ governor pinned, three runs per board. Message count (256) and AVR payload
 (9154 bytes, md5 `e7bc7960e32d93d094c413300cd1227e`) are identical to upstream —
 this is a pure speed change, not a behaviour change.
 
-The same 10 s of live IQ now decodes in 7.25 s instead of 15.9 s, so the pipeline
+The same 10 s of live IQ now decodes in ~7.3 s instead of 15.9 s, so the pipeline
 runs comfortably faster than real time on this hardware instead of falling behind.
+v1.0.3 adds a cross-core prefetch on the consumer side: 7.42 → 7.28 s measured
+back-to-back against the previous build on board A (−1.9 %).
 
 ## What was changed
 
@@ -56,6 +58,13 @@ Eight files, all in the demodulation hot path. `main.cpp` and `src/` are untouch
    `NumFreeSampleBuffers` is `NumSampleBuffers - 2`, not `- 1`: the demodulator
    reaches back into the previous block (`lookBack` up to 1524 samples), and a
    writer one block ahead would overwrite it.
+
+7. **Cross-core prefetch** (`include/SampleStream.hpp`, `include/Global.hpp`,
+   v1.0.3)
+   The magnitude ring exceeds L1 and is written by the producer core, so the
+   consumer misses L1 on every line and stalls on the shared L2. Prefetches are
+   issued a few bit periods ahead (`STREAM1090_PREFETCH_DIST`) so the L2 latency
+   overlaps the shift work: −1.9 % wall time, byte-identical output.
 
 Full diff against upstream: `patches/0001-cortex-a7-neon-pipeline.patch`.
 

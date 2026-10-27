@@ -104,7 +104,8 @@ present in the two-thread draft and fixed before any benchmark was trusted.
 ## 5. Input block size
 
 `DesiredInputBufferSize` 8192 → 1024 drops each hand-off block from 154 KB to
-21 KB, which is what finally makes the producer→consumer hand-off cache-resident.
+21 KB, which brings the producer→consumer hand-off into the cache-resident
+range.
 8.43 s → 7.25 s. Going to 576 (14 KB) changes nothing measurable.
 
 Overridable at build time:
@@ -125,6 +126,24 @@ all parameterised on `NumStreams`. It also happens to be faster (190 KB vs 722 K
 of code, 19% better on this hardware). On a machine with enough RAM, switch back
 to `DefaultPresets.hpp` and every upstream combination is available in one binary.
 
+## 7. Cross-core prefetch (v1.0.3)
+
+The magnitude ring lives on the producer side of the pipeline boundary. It is
+86 KB — wider than the 32 KB L1D — and every line in it was written by the
+other core, so the consumer misses L1 on every access and the in-order
+Cortex-A7 sits idle until the shared 256 KB L2 answers. At ~1 M bit periods per
+second and six cache lines per period, that latency is a large share of the
+consumer's ~7.1 s.
+
+The fix is earlier loads, not fewer: `consumeOneBlock` issues a prefetch
+(`pld`) for the lines the Manchester/shift loop is about to touch, a few bit
+periods ahead. The distance is `STREAM1090_PREFETCH_DIST` in
+`include/Global.hpp`. The L2 latency then overlaps shift work already in
+flight instead of stalling it.
+
+Measured back-to-back against a control re-run of the previous build in the
+same session: 7.42 s → 7.28 s (−1.9 %), AVR output byte-identical.
+
 ## What this is not
 
 - Not a generic ARM speed-up. `-mcpu=cortex-a7` and the 128-bit NEON assumption
@@ -133,5 +152,6 @@ to `DefaultPresets.hpp` and every upstream combination is available in one binar
   upstream on every capture tested.
 - Not finished. The consumer still spends 21.7% in `dispatchHandled` and 9.6% in
   `handleExtSquitterLongMessage`; both were inspected and no profitable
-  restructuring was found on this ISA. See `docs/benchmarks.md` §5 for what was
-  measured and rejected.
+  restructuring was found on this ISA. One measured gain from after the
+  v1.0.2 benchmarks — the cross-core prefetch (§7) — is included in
+  v1.0.3. See `docs/benchmarks.md` §5 for what was measured and rejected.

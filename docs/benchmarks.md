@@ -38,6 +38,12 @@ Output identity: 256 messages, 9154 bytes of AVR, md5
 `e7bc7960e32d93d094c413300cd1227e` — byte-identical for both binaries on both
 boards.
 
+v1.0.3 adds a cross-core prefetch on the consumer side (see §4). Measured
+back-to-back in one session against a control re-run of the v1.0.2 build
+(7.427 / 7.376 / 7.444, mean 7.42), it brings the same board to
+7.327 / 7.278 / 7.269 (mean 7.28, −1.9 %); the shipped release binary measures
+7.231 / 7.304 / 7.278 s. Output stays byte-identical.
+
 ## 2. Where the time went
 
 Each row is a separate build; the deltas are the isolated contribution of one
@@ -52,11 +58,17 @@ change (same capture, same flags, board A).
 | … + Manchester fused into the shift | 8.43 | step 3 + 4 |
 | … + input block 8192 → 1024 | 7.25 | step 5 |
 | … + input block 1024 → 576 | 7.24 | no further gain |
+| … + cross-core prefetch (v1.0.3) | 7.28 | step 6; the v1.0.2 build re-ran at 7.42 in the same session |
+
+Each session drifts by ±0.1 s (thermal, /tmp state), which is why the prefetch
+row is quoted against a control re-run measured minutes before it, not against
+the 7.25 above.
 
 Two conclusions that shaped the rest of the work:
 
-- The demodulation side is 68% of the original run time (15.87 − 5.07 s). Any
-  optimisation that does not touch `DemodCore` is capped at a 1.5× overall gain.
+- The demodulation side is 68% of the original run time (15.87 − 5.07 s). On
+  arithmetic alone, an optimisation that does not touch `DemodCore` keeps the
+  overall gain near 1.5× even in the ideal case.
 - Removing `sqrt` saves only 0.8 s, so the magnitude stage is not worth
   vectorising.
 
@@ -91,6 +103,14 @@ boundary. 1024 is the sweet spot; the value is overridable at build time with
 Consumer work is ~7.1 s of the 7.25 s wall time, producer work ~4.0 s. They run
 concurrently, so the wall time is the consumer's. That is why further
 producer-side optimisation no longer moves the total.
+
+v1.0.3 attacks the memory side of that consumer time. The magnitude ring is
+86 KB — wider than the 32 KB L1D — and every line in it was written by the
+producer core, so the consumer misses L1 on every access and the in-order
+Cortex-A7 stalls until the shared L2 answers. The consumer now issues
+prefetches a few bit periods ahead (`STREAM1090_PREFETCH_DIST`), letting the
+L2 latency overlap shift work already in flight: 7.42 → 7.28 s in the
+same-session measurement quoted in §2.
 
 ## 5. What was tried and rejected
 

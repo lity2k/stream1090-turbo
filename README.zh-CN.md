@@ -19,7 +19,8 @@ crypto/CRC 指令）的 [stream1090](https://github.com/mgrone/stream1090) 硬�
 performance，每块板各跑 3 次。报文数（256）与 AVR 负载（9154 字节，md5
 `e7bc7960e32d93d094c413300cd1227e`）与上游完全一致 —— 这是纯速度改动，不改变行为。
 
-原本处理 10 秒实时 IQ 需要 15.9 秒（持续积压），现在 7.25 秒完成，能稳定跟上采集。
+原本处理 10 秒实时 IQ 需要 15.9 秒（持续积压），现在约 7.3 秒完成，能稳定跟上采集。
+v1.0.3 在消费者侧新增跨核预取：同会话背靠背对比前一构建为 7.42 → 7.28 s（−1.9%）。
 
 ## 改了什么
 
@@ -50,6 +51,11 @@ performance，每块板各跑 3 次。报文数（256）与 AVR 负载（9154 �
 6. **修正环形缓冲余量**
    `NumFreeSampleBuffers` 为 `NumSampleBuffers - 2` 而非 `- 1`：解调器会回看上一块
    （`lookBack` 最大 1524 样本），只留一块余量会被写者覆盖。
+
+7. **跨核预取**（`include/SampleStream.hpp`、`include/Global.hpp`，v1.0.3）
+   取模环形缓冲超出 L1 且由生产者核写入，消费者每行必 L1 miss、停顿等共享 L2。
+   现在提前几个位周期发出预取（`STREAM1090_PREFETCH_DIST`），让 L2 延迟与移位
+   工作重叠：墙钟 −1.9%，输出逐字节一致。
 
 与上游的完整 diff：`patches/0001-cortex-a7-neon-pipeline.patch`。
 

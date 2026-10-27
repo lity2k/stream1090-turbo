@@ -6,8 +6,8 @@ Four routes, in order of how well they perform on the target:
 
 | route | where it runs | throughput | when to use |
 |---|---|---|---|
-| `install.sh` (prebuilt) | nowhere, it unpacks | 7.23 s (fastest) | default: no compiler on the board |
-| native `install.sh --build` | on the board | 7.23 s | you want the binary built from this tree |
+| `install.sh` (prebuilt) | nowhere, it unpacks | 7.28 s (fastest) | default: no compiler on the board |
+| native `install.sh --build` | on the board | 7.28 s | you want the binary built from this tree |
 | `install.sh --upstream` | on the board | depends on upstream | you want the latest official source |
 | `cmake` | on the board | slower, all presets | you want upstream's build system |
 | `tools/crossbuild.sh` | on an x86_64 host | 7.82 s single / 8.62 s all presets | board cannot hold the compiler |
@@ -107,9 +107,10 @@ tools/install.sh . /opt/turbo                        # custom prefix
 ```
 
 One preset is the default on purpose: a translation unit with all 27 upstream
-instances is OOM-killed on a 512 MB board. `install.sh` uses the exact flag set the
-benchmarks were taken with, so the resulting binary has md5
-`f91f3d70436e46c48fdac40251a0277c`.
+instances is OOM-killed on a 512 MB board. `install.sh` uses the exact flag set
+the benchmarks were taken with; built at the commit recorded in
+`prebuilt/MANIFEST`, the result is bit-identical to the shipped prebuilt
+(md5 `4a21451369e321f84f0d17a945f8496c`).
 
 Do not add or remove `-DSTREAM1090_*` flags when comparing against the published
 numbers; some of them change code generation even where the guarded code is not

@@ -37,6 +37,10 @@ works for the comparison as long as both binaries see the same bytes.
 The two boards produce the same md5 as each other, which also rules out
 board-specific behaviour in the decoder.
 
+The v1.0.3 binary (cross-core prefetch) was re-validated the same way on board A:
+7.231 / 7.304 / 7.278 s, 256 messages, AVR md5 `e7bc7960…` — byte-identical to
+every earlier release.
+
 ## 3. Live-capture check
 
 Benchmarking on a stored file can hide an input-path regression, so one run used a
@@ -88,7 +92,8 @@ run through the bit-exact test. Treat `-u 8` as verified-by-inspection only.
 
 ## 7. Rebuild reproducibility
 
-Rebuilding from a fresh checkout of this repository with `tools/install.sh`
-produces a binary with md5 `f91f3d70436e46c48fdac40251a0277c`, identical to the
-binary all the numbers above were measured on. That is checked after every change
-to the tree, and after every upstream sync.
+The shipped prebuilt was compiled on the target board with `tools/install.sh`
+and the version string recorded in `prebuilt/MANIFEST` (`built_version` pins the
+commit and build number); its md5 is `4a21451369e321f84f0d17a945f8496c`.
+Rebuilding that same commit with the same command reproduces it bit for bit.
+That is checked after every change to the tree, and after every upstream sync.
