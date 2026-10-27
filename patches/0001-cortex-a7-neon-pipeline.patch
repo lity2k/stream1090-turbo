@@ -1,5 +1,6 @@
---- a/include/BlockRing.hpp
-+++ b/include/BlockRing.hpp
+diff -urN upstream/include/BlockRing.hpp opt/include/BlockRing.hpp
+--- a/include/BlockRing.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/BlockRing.hpp	2026-10-27 09:16:26.206043900 +0800
 @@ -7,6 +7,7 @@
  
  #pragma once
@@ -31,8 +32,9 @@
 +    // the pipelined build only needs the counter itself to be race free
 +    std::atomic<size_t> m_fullBlocks{0};
  };
---- a/include/DemodCore.hpp
-+++ b/include/DemodCore.hpp
+diff -urN upstream/include/DemodCore.hpp opt/include/DemodCore.hpp
+--- a/include/DemodCore.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/DemodCore.hpp	2026-10-27 09:16:26.313988000 +0800
 @@ -93,7 +93,17 @@
  		// the shift registers tell us which streams ended up on a downlink
  		// format we handle. That is a rare event, so most calls leave here
@@ -52,9 +54,10 @@
  		// the streams and crc's are ready
  		m_cache.tick();
  
---- a/include/Global.hpp
-+++ b/include/Global.hpp
-@@ -14,6 +14,11 @@
+diff -urN upstream/include/Global.hpp opt/include/Global.hpp
+--- a/include/Global.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/Global.hpp	2026-10-27 15:17:57.351649400 +0800
+@@ -14,6 +14,17 @@
  #define STREAM1090_VERSION "261013"
  #endif
  
@@ -63,11 +66,18 @@
 +#define STREAM1090_PIPELINE_THREADS 2
 +#endif
 +
++// 解调线程读预取提前量（bit 周期数）。mag ring 由生产者核写入，消费者核
++// 每行都是 L1 miss；提前 PLD 让 L2 延迟与移位计算重叠。0 可关。
++#ifndef STREAM1090_PREFETCH_DIST
++#define STREAM1090_PREFETCH_DIST 8
++#endif
++
  struct GlobalOptions {
      #ifdef STATS_ENABLED
          static constexpr bool StatsEnabled = (STATS_ENABLED != 0);
---- a/include/InputReaderBase.hpp
-+++ b/include/InputReaderBase.hpp
+diff -urN upstream/include/InputReaderBase.hpp opt/include/InputReaderBase.hpp
+--- a/include/InputReaderBase.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/InputReaderBase.hpp	2026-10-27 09:16:26.525799000 +0800
 @@ -54,18 +54,13 @@
              }
  
@@ -91,8 +101,9 @@
              }
          }
      }
---- a/include/SampleStream.hpp
-+++ b/include/SampleStream.hpp
+diff -urN upstream/include/SampleStream.hpp opt/include/SampleStream.hpp
+--- a/include/SampleStream.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/SampleStream.hpp	2026-10-27 15:17:46.666447700 +0800
 @@ -11,6 +11,11 @@
  #include "BlockRing.hpp"
  #include "DemodCore.hpp"
@@ -168,7 +179,7 @@
          // check if actually we need the sampler to resample, or if this is a 1:1 sampling
          if constexpr(Sampler::isPassthrough) {
              // tell the input reader to get us some data. Directly as magnitude. Since this is a passthrough sampler
-@@ -203,35 +224,84 @@
+@@ -203,35 +224,95 @@
              // now ask the Sampler to resample the input magnitude to the output samples
              // similar to the input buffer, write after the overlap to keep some old values for the next iteration
              if (m_inputRingBuffer.isReadable()) {
@@ -206,7 +217,18 @@
 +    // shifted decisions, then hand the bits to the core
 +    auto consumeOneBlock = [&]() {
 +        m_demodPos = m_sampleRingBuffer.readPos();
++        // The magnitude ring is written by the producer core, so every line
++        // the demodulator touches is an L1 miss on this core, and the core
++        // stalls in order until it arrives. Issue the loads for a few bit
++        // periods ahead so the L2 latency overlaps the shifting work.
++#if !defined(STREAM1090_NO_PREFETCH)
++        constexpr size_t PrefetchDist = STREAM1090_PREFETCH_DIST * Sampler::NumStreams;
++#endif
 +        for (size_t i = 0; i < Sampler::SampleBufferSize; i += Sampler::NumStreams) {
++#if !defined(STREAM1090_NO_PREFETCH)
++            if (i + PrefetchDist < Sampler::SampleBufferSize + Sampler::SampleBufferOverlap)
++                __builtin_prefetch(m_demodPos + PrefetchDist, 0, 1);
++#endif
 +            // Think of having a sample stream of 2Mhz (so what we get from the planes)
 +            // stream 0 << compare 0 and 1 
 +            // stream 1 << compare 1 and 2
@@ -275,8 +297,9 @@
      }
 +#endif
  }
---- a/include/Sampler.hpp
-+++ b/include/Sampler.hpp
+diff -urN upstream/include/Sampler.hpp opt/include/Sampler.hpp
+--- a/include/Sampler.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/Sampler.hpp	2026-10-27 09:16:26.720954300 +0800
 @@ -133,7 +133,13 @@
      
      
@@ -292,8 +315,9 @@
      static constexpr size_t NumBlocks = (DesiredInputBufferSize / (RatioInput * SampleBlockSize * 2) + 1) * (SampleBlockSize * 2);
      
      
---- a/include/ShiftRegisters.hpp
-+++ b/include/ShiftRegisters.hpp
+diff -urN upstream/include/ShiftRegisters.hpp opt/include/ShiftRegisters.hpp
+--- a/include/ShiftRegisters.hpp	2026-10-27 09:15:46.000000000 +0800
++++ b/include/ShiftRegisters.hpp	2026-10-27 15:49:44.317257700 +0800
 @@ -2,13 +2,16 @@
   * Copyright 2025 Martin Gronemann
   *
@@ -344,7 +368,7 @@
          };
      }
  
-@@ -46,21 +65,37 @@
+@@ -46,21 +65,40 @@
      /// separate array for it meant storing NumStreams words every sample to
      /// serve a read that only happens on a handled format. Derived here
      /// instead, from the value the update has already written.
@@ -367,6 +391,9 @@
 +    // per lane shift plus the carry from the next lower word, and both stay
 +    // inside the lanes, so four streams move through the update together.
 +    // Word 0 holds bits 31..0, word 3 bits 127..96.
++    // (An interleaved layout with VLD4/VST4 was measured 12% slower on the
++    // Cortex-A7: structured accesses are multi-cycle and stall the pipeline,
++    // plain VLD1 overlaps with the NEON arithmetic. Do not retry.)
 +    uint32_t m_w0[Padded];
 +    uint32_t m_w1[Padded];
 +    uint32_t m_w2[Padded];
@@ -387,7 +414,7 @@
  };
  
  
-@@ -79,6 +114,9 @@
+@@ -79,6 +117,9 @@
          /// mispredictions, and without them the loop has no control flow left
          /// for the compiler to trip over.
          uint64_t shiftInNewBits(const uint32_t* cmp) noexcept {
@@ -397,7 +424,7 @@
              uint64_t handledMask = 0;
  
              for (auto i = 0; i < NumStreams; i++) {
-@@ -112,17 +150,150 @@
+@@ -112,17 +153,150 @@
              }
  
              return handledMask;
@@ -548,7 +575,8 @@
          static constexpr CRC::crc_t Delta55  = CRC::delta<55>();
          static constexpr CRC::crc_t Delta111 = CRC::delta<111>();
          static constexpr CRC::crc_t Polynomial = CRC::polynomial;
---- /dev/null
-+++ b/presets/BenchPresets.hpp
+diff -urN upstream/presets/BenchPresets.hpp opt/presets/BenchPresets.hpp
+--- a/presets/BenchPresets.hpp	1970-01-01 08:00:00.000000000 +0800
++++ b/presets/BenchPresets.hpp	2026-10-27 09:16:26.842067100 +0800
 @@ -0,0 +1 @@
 +ADD_PRESET(RtlSdr, 2.56, 12)

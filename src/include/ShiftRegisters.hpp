@@ -81,6 +81,9 @@ class alignas(16) ShiftRegistersBase {
     // per lane shift plus the carry from the next lower word, and both stay
     // inside the lanes, so four streams move through the update together.
     // Word 0 holds bits 31..0, word 3 bits 127..96.
+    // (An interleaved layout with VLD4/VST4 was measured 12% slower on the
+    // Cortex-A7: structured accesses are multi-cycle and stall the pipeline,
+    // plain VLD1 overlaps with the NEON arithmetic. Do not retry.)
     uint32_t m_w0[Padded];
     uint32_t m_w1[Padded];
     uint32_t m_w2[Padded];

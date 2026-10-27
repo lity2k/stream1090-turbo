@@ -19,6 +19,12 @@
 #define STREAM1090_PIPELINE_THREADS 2
 #endif
 
+// 解调线程读预取提前量（bit 周期数）。mag ring 由生产者核写入，消费者核
+// 每行都是 L1 miss；提前 PLD 让 L2 延迟与移位计算重叠。0 可关。
+#ifndef STREAM1090_PREFETCH_DIST
+#define STREAM1090_PREFETCH_DIST 8
+#endif
+
 struct GlobalOptions {
     #ifdef STATS_ENABLED
         static constexpr bool StatsEnabled = (STATS_ENABLED != 0);

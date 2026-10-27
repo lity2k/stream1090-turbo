@@ -237,7 +237,18 @@ inline void SampleStream<Sampler>::read(InputReaderType& inputReader, Handler& m
     // shifted decisions, then hand the bits to the core
     auto consumeOneBlock = [&]() {
         m_demodPos = m_sampleRingBuffer.readPos();
+        // The magnitude ring is written by the producer core, so every line
+        // the demodulator touches is an L1 miss on this core, and the core
+        // stalls in order until it arrives. Issue the loads for a few bit
+        // periods ahead so the L2 latency overlaps the shifting work.
+#if !defined(STREAM1090_NO_PREFETCH)
+        constexpr size_t PrefetchDist = STREAM1090_PREFETCH_DIST * Sampler::NumStreams;
+#endif
         for (size_t i = 0; i < Sampler::SampleBufferSize; i += Sampler::NumStreams) {
+#if !defined(STREAM1090_NO_PREFETCH)
+            if (i + PrefetchDist < Sampler::SampleBufferSize + Sampler::SampleBufferOverlap)
+                __builtin_prefetch(m_demodPos + PrefetchDist, 0, 1);
+#endif
             // Think of having a sample stream of 2Mhz (so what we get from the planes)
             // stream 0 << compare 0 and 1 
             // stream 1 << compare 1 and 2
