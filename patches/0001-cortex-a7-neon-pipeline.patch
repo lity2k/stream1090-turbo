@@ -1,0 +1,554 @@
+--- a/include/BlockRing.hpp
++++ b/include/BlockRing.hpp
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <cstring>
+ #include <memory>
+ #include <algorithm>
+@@ -70,11 +71,11 @@
+     }
+ 
+     bool isReadable() const noexcept {
+-        return m_fullBlocks > 0;
++        return m_fullBlocks.load(std::memory_order_relaxed) > 0;
+     }
+ 
+     bool isWritable() const noexcept {
+-        return m_fullBlocks < NumBlocks;
++        return m_fullBlocks.load(std::memory_order_relaxed) < NumBlocks;
+     }
+ 
+     const T& lookBack(size_t k, size_t offsetInBlock = 0) const noexcept {
+@@ -102,5 +103,7 @@
+ 
+     size_t m_readPos;
+     size_t m_writePos;
+-    size_t m_fullBlocks;
++    // relaxed is enough: the caller's own gate orders the block handoff, and
++    // the pipelined build only needs the counter itself to be race free
++    std::atomic<size_t> m_fullBlocks{0};
+ };
+--- a/include/DemodCore.hpp
++++ b/include/DemodCore.hpp
+@@ -93,7 +93,17 @@
+ 		// the shift registers tell us which streams ended up on a downlink
+ 		// format we handle. That is a rare event, so most calls leave here
+ 		// without touching the dispatcher at all.
+-		uint64_t handledStreams = m_shiftRegisters.shiftInNewBits(cmp);
++		dispatchHandled(m_shiftRegisters.shiftInNewBits(cmp));
++	}
++
++	/// Same, with the bits taken straight off the magnitude ring: stream j's
++	/// bit is mag[j] > mag[j + NumStreams/2]. Keeps the per bit decision in a
++	/// vector register instead of a NumStreams wide array.
++	void shiftInNewBitsFromSamples(const int32_t* mag) {
++		dispatchHandled(m_shiftRegisters.shiftInNewBitsFromSamples(mag));
++	}
++
++	void dispatchHandled(uint64_t handledStreams) {
+ 		// the streams and crc's are ready
+ 		m_cache.tick();
+ 
+--- a/include/Global.hpp
++++ b/include/Global.hpp
+@@ -14,6 +14,11 @@
+ #define STREAM1090_VERSION "261013"
+ #endif
+ 
++// 1 = 原来的单线程直通; 2 = 输入级与解调级各占一个线程
++#ifndef STREAM1090_PIPELINE_THREADS
++#define STREAM1090_PIPELINE_THREADS 2
++#endif
++
+ struct GlobalOptions {
+     #ifdef STATS_ENABLED
+         static constexpr bool StatsEnabled = (STATS_ENABLED != 0);
+--- a/include/InputReaderBase.hpp
++++ b/include/InputReaderBase.hpp
+@@ -54,18 +54,13 @@
+             }
+ 
+             for (size_t i = 0; i < n; i++) {
+-                    // Linear magnitude, as before, but the samples are integers
+-                    // now. Squaring the ring instead would be cheaper, and the
+-                    // square root is monotone so it cannot flip a comparison --
+-                    // but the resampler interpolates this ring, and interpolation
+-                    // does not commute with squaring, which costs about 0.5% of
+-                    // messages on a busy 2.4 Msps feed. Measured, so kept linear.
+                     const int32_t i2 = int32_t(m_tileI[i]) * int32_t(m_tileI[i]);
+                     const int32_t q2 = int32_t(m_tileQ[i]) * int32_t(m_tileQ[i]);
+-                    // 8 fractional bits kept: the root of a weak sample is only
+-                    // a couple of hundred, and truncating it to an integer costs
+-                    // about 0.3% of messages on its own.
++#if defined(STREAM1090_NO_SQRT)
++                    out[base + i] = i2 + q2;
++#else
+                     out[base + i] = int32_t(std::sqrt(float(i2 + q2)) * 256.0f + 0.5f);
++#endif
+             }
+         }
+     }
+--- a/include/SampleStream.hpp
++++ b/include/SampleStream.hpp
+@@ -11,6 +11,11 @@
+ #include "BlockRing.hpp"
+ #include "DemodCore.hpp"
+ #include "MessageHandler.hpp"
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <mutex>
++#include <thread>
+ 
+ // the main stream class. This class manages reading from the input stream
+ // and also manages the buffers
+@@ -18,11 +23,20 @@
+ class SampleStream {
+ public:
+     static constexpr size_t NumInputBuffers = 2;
+-    // for now we will keep one extra sample buffer as history
+-    static constexpr size_t NumSampleBuffers = 2;
++    // One extra sample buffer as history. The pipelined build runs the input
++    // stages and the demodulator on separate threads, so it needs enough slack
++    // to keep both busy.
++    static constexpr size_t NumSampleBuffers =
++        (STREAM1090_PIPELINE_THREADS >= 2) ? 4 : 2;
++    // Not every buffer of the ring is free: the demodulator reaches back past
++    // the start of the block it is reading (confidence, RSSI, preamble, SNR),
++    // so the block before the one being read still has to hold its own data.
++    // Two less than the ring holds is what the writer may run ahead by: with
++    // one less it would already be overwriting that block.
++    static constexpr size_t NumFreeSampleBuffers = NumSampleBuffers - 2;
+     static constexpr size_t TotalSampleBufferLength = NumSampleBuffers * Sampler::SampleBufferSize + Sampler::SampleBufferOverlap;
+ 
+-    SampleStream() : m_inputRingBuffer(0), m_sampleRingBuffer(0) { }
++    SampleStream() : m_inputRingBuffer(0), m_sampleRingBuffer(0) {}
+    
+     // the main method that streams from InputStream using inputReader
+     template<typename InputReaderType, MessageHandler Handler>
+@@ -156,13 +170,24 @@
+     // and a linear magnitude comes back as stored / MagScale.
+     static constexpr float MagScale = float(SampleOne) * 256.0f;
+ 
+-    uint32_t m_newBits[Sampler::NumStreams];
+     // we have one ring buffer for the IQ pipeline
+     BlockRing<int32_t, Sampler::InputBufferSize,  NumInputBuffers,  Sampler::InputBufferOverlap>  m_inputRingBuffer;
+     // and one for the upsampled magnitudes
+     BlockRing<int32_t, Sampler::SampleBufferSize, NumSampleBuffers, Sampler::SampleBufferOverlap> m_sampleRingBuffer;
+     // not nice. Will change
+     const int32_t* m_demodPos = nullptr;
++
++    // ---- producer/consumer gate (STREAM1090_PIPELINE_THREADS >= 2) ----
++    // The input stages (convert, FIR, magnitude, upsampler) and the
++    // demodulator are two independent passes over the same ring: the writer
++    // only advances the write position, the reader only the read position.
++    // The counts below are what turns that into a pipeline, and the mutex is
++    // only ever taken once per block.
++    std::mutex m_gateMutex;
++    std::condition_variable m_gateCv;
++    size_t m_produced = 0;
++    size_t m_consumed = 0;
++    bool m_producerDone = false;
+ };
+ 
+ 
+@@ -183,11 +208,7 @@
+     };
+     demodCore.setSnrSource(this, snrSource);
+ 
+-     // the main loop for reading the stream
+-    while (!inputReader.eof()) {
+-        // the read and write positions for the current sample buffer based its index.
+-        // we start reading at 0 + i * size           
+-        // however, new values will be written NumStream / 2 later which is the overlap. 
++    auto produceOneBlock = [&]() {
+         // check if actually we need the sampler to resample, or if this is a 1:1 sampling
+         if constexpr(Sampler::isPassthrough) {
+             // tell the input reader to get us some data. Directly as magnitude. Since this is a passthrough sampler
+@@ -203,35 +224,84 @@
+             // now ask the Sampler to resample the input magnitude to the output samples
+             // similar to the input buffer, write after the overlap to keep some old values for the next iteration
+             if (m_inputRingBuffer.isReadable()) {
++#if !defined(STREAM1090_NO_SAMP)
+                 Sampler::sample(m_inputRingBuffer.readPos(), m_sampleRingBuffer.writePos());
++#endif
+                 m_inputRingBuffer.advanceReadPos();
+                 m_sampleRingBuffer.advanceWritePos();
+             }
+         }
+-        
++    };
+ 
+-        if (m_sampleRingBuffer.isReadable()) {
+-            m_demodPos = m_sampleRingBuffer.readPos();
+-            // extract phase shifted bits using manchester encoding
+-            for (size_t i = 0; i < Sampler::SampleBufferSize; i += Sampler::NumStreams) {
+-                for (size_t j = 0; j < Sampler::NumStreams; j++) {
+-                    // Think of having a sample stream of 2Mhz (so what we get from the planes)
+-                    // stream 0 << compare 0 and 1 
+-                    // stream 1 << compare 1 and 2
+-                    // 
+-                    // stream 0 << compare 2 and 3
+-                    // stream 1 << compare 3 and 4
+-                    // ....
+-                    // because the message might be shifted by one symbol
+-                    m_newBits[j] = m_demodPos[j] > m_demodPos[j + (Sampler::NumStreams >> 1)]; 
+-                    //m_sampleReadPos[i + j] > sampleReadPos[i + j + Sampler::SampleBufferOverlap];  
+-                }
+-                // and tell the demodulator to deal with the new bits
+-                demodCore.shiftInNewBits(m_newBits);
+-                // advance the readpos
+-                m_demodPos += Sampler::NumStreams;
++    // one block of the demodulator: manchester compare the NumStreams phase
++    // shifted decisions, then hand the bits to the core
++    auto consumeOneBlock = [&]() {
++        m_demodPos = m_sampleRingBuffer.readPos();
++        for (size_t i = 0; i < Sampler::SampleBufferSize; i += Sampler::NumStreams) {
++            // Think of having a sample stream of 2Mhz (so what we get from the planes)
++            // stream 0 << compare 0 and 1 
++            // stream 1 << compare 1 and 2
++            // 
++            // stream 0 << compare 2 and 3
++            // stream 1 << compare 3 and 4
++            // ....
++            // because the message might be shifted by one symbol.
++            // The compare runs inside the shift register update, so the 0/1
++            // decisions never reach memory.
++#if !defined(STREAM1090_NO_DEMOD)
++            demodCore.shiftInNewBitsFromSamples(m_demodPos);
++#endif
++            // advance the readpos
++            m_demodPos += Sampler::NumStreams;
++        }
++        m_sampleRingBuffer.advanceReadPos();
++    };
++
++#if STREAM1090_PIPELINE_THREADS >= 2
++    // The demodulator runs on its own core. Everything it touches is either
++    // its own state or the read half of the ring, so the two passes overlap
++    // and the run takes as long as the slower of them instead of their sum.
++    std::thread demodThread([&] {
++        for (;;) {
++            {
++                std::unique_lock<std::mutex> lock(m_gateMutex);
++                m_gateCv.wait(lock, [&] { return m_consumed < m_produced || m_producerDone; });
++                if (m_consumed == m_produced)
++                    return;
++            }
++            consumeOneBlock();
++            {
++                std::lock_guard<std::mutex> lock(m_gateMutex);
++                m_consumed++;
+             }
+-            m_sampleRingBuffer.advanceReadPos();
++            m_gateCv.notify_one();
++        }
++    });
++
++    while (!inputReader.eof()) {
++        {
++            std::unique_lock<std::mutex> lock(m_gateMutex);
++            m_gateCv.wait(lock, [&] { return m_produced - m_consumed < NumFreeSampleBuffers; });
++        }
++        produceOneBlock();
++        {
++            std::lock_guard<std::mutex> lock(m_gateMutex);
++            m_produced++;
+         }
++        m_gateCv.notify_one();
++    }
++
++    {
++        std::lock_guard<std::mutex> lock(m_gateMutex);
++        m_producerDone = true;
++    }
++    m_gateCv.notify_one();
++    demodThread.join();
++#else
++    while (!inputReader.eof()) {
++        produceOneBlock();
++        if (m_sampleRingBuffer.isReadable())
++            consumeOneBlock();
+     }
++#endif
+ }
+--- a/include/Sampler.hpp
++++ b/include/Sampler.hpp
+@@ -133,7 +133,13 @@
+     
+     
+     // This is the desired input buffer size. This will be a lower bound.
+-    static constexpr size_t DesiredInputBufferSize = 8192;
++    // It sets the block the two pipeline stages hand over: 1024 makes it
++    // 5400 samples (21 KB), which is what the demodulator's ring has to be to
++    // stay inside the cache. 8192 (154 KB) costs 1.2 s of the 10 s run.
++#ifndef STREAM1090_INPUT_BUFFER_TARGET
++#define STREAM1090_INPUT_BUFFER_TARGET 1024
++#endif
++    static constexpr size_t DesiredInputBufferSize = STREAM1090_INPUT_BUFFER_TARGET;
+     static constexpr size_t NumBlocks = (DesiredInputBufferSize / (RatioInput * SampleBlockSize * 2) + 1) * (SampleBlockSize * 2);
+     
+     
+--- a/include/ShiftRegisters.hpp
++++ b/include/ShiftRegisters.hpp
+@@ -2,13 +2,16 @@
+  * Copyright 2025 Martin Gronemann
+  *
+  * This file is part of stream1090 and is licensed under the GNU General
+- * Public License v3.0. See the top-level LICENSE file for details.
++ * Public License v3. See the top-level LICENSE file for details.
+  */
+ 
+ #pragma once
+ 
+ #include "Bits128.hpp"
+ #include "CRC.hpp"
++#if defined(__ARM_NEON)
++#include <arm_neon.h>
++#endif
+ 
+ // Downlink formats the demodulator actually looks at: 0, 4, 5, 11, 16, 17, 18,
+ // 19, 20, 21. Every other value is dropped right away, so the shift register
+@@ -25,12 +28,28 @@
+     // one bit per stream has to fit into the returned mask
+     static_assert(NumStreams <= 64, "stream mask is 64 bit wide");
+ 
++    // The vector update walks the streams four at a time, so the arrays are
++    // padded up to a whole group. Padding lanes shift in zeros and their hits
++    // are masked off before the mask leaves shiftInNewBits().
++    static constexpr int NumGroups = (NumStreams + 3) / 4;
++    static constexpr int Padded    = NumGroups * 4;
++    static constexpr uint64_t StreamMask =
++        (NumStreams >= 64) ? ~uint64_t(0) : ((uint64_t(1) << NumStreams) - 1);
++    static constexpr int Half = NumStreams / 2;
++
+     constexpr ShiftRegistersBase() noexcept {
+-        for (auto i = 0; i < NumStreams; i++) {
++        for (auto i = 0; i < Padded; i++) {
++        #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++            m_w0[i] = 0;
++            m_w1[i] = 0;
++            m_w2[i] = 0;
++            m_w3[i] = 0;
++        #else
++            m_high[i] = 0;
++            m_low[i]  = 0;
++        #endif
+             m_crc_56[i]  = 0;
+             m_crc_112[i] = 0;
+-            m_high[i] = 0;
+-            m_low[i] = 0;
+         };
+     }
+ 
+@@ -46,21 +65,37 @@
+     /// separate array for it meant storing NumStreams words every sample to
+     /// serve a read that only happens on a handled format. Derived here
+     /// instead, from the value the update has already written.
+-    constexpr uint32_t getDF(auto i) const noexcept{
++    constexpr uint32_t getDF(auto i) const noexcept {
++    #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++        return m_w3[i] >> 27;
++    #else
+         return (uint32_t)(m_high[i] >> 59);
++    #endif
+     }
+ 
+     protected:
+ 
+-    uint64_t m_low[NumStreams];
+-    uint64_t m_high[NumStreams];
++#if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++    // The 128 bit register of every stream, split into its four 32 bit words:
++    // one array per word, one lane per stream. A shift left by one is then a
++    // per lane shift plus the carry from the next lower word, and both stay
++    // inside the lanes, so four streams move through the update together.
++    // Word 0 holds bits 31..0, word 3 bits 127..96.
++    uint32_t m_w0[Padded];
++    uint32_t m_w1[Padded];
++    uint32_t m_w2[Padded];
++    uint32_t m_w3[Padded];
++#else
++    uint64_t m_low[Padded];
++    uint64_t m_high[Padded];
++#endif
+ 
+ 	// And a checksum for the short messages (56 bit). Never wider than 25 bits,
+ 	// so it is held in 32 and the update moves half the bytes it used to.
+-	CRC::crc_t m_crc_56[NumStreams];
++	CRC::crc_t m_crc_56[Padded];
+ 
+     // Each stream has a checksum for long messages (112 bit)
+-	CRC::crc_t m_crc_112[NumStreams];
++	CRC::crc_t m_crc_112[Padded];
+ };
+ 
+ 
+@@ -79,6 +114,9 @@
+         /// mispredictions, and without them the loop has no control flow left
+         /// for the compiler to trip over.
+         uint64_t shiftInNewBits(const uint32_t* cmp) noexcept {
++        #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++            return shiftInNewBitsNeon([&](int g) { return vld1q_u32(cmp + 4 * g); });
++        #else
+             uint64_t handledMask = 0;
+ 
+             for (auto i = 0; i < NumStreams; i++) {
+@@ -112,17 +150,150 @@
+             }
+ 
+             return handledMask;
++        #endif
++        }
++
++        /// Same update, but the bits come straight off the magnitude ring:
++        /// stream j's bit is mag[j] > mag[j + NumStreams/2]. Doing the compare
++        /// inside the update keeps the per bit result in a vector register
++        /// instead of round tripping it through a NumStreams wide array.
++        uint64_t shiftInNewBitsFromSamples(const int32_t* mag) noexcept {
++        #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++            using Base = ShiftRegistersBase<NumStreams>;
++            const uint32x4_t one = vdupq_n_u32(1u);
++            return shiftInNewBitsNeon([&](int g) {
++                const int o = 4 * g;
++                uint32x4_t cmp = vcgtq_s32(vld1q_s32(mag + o), vld1q_s32(mag + o + Base::Half));
++                if constexpr (Base::Padded != NumStreams)
++                    cmp = vandq_u32(cmp, laneValidMask(g));
++                return vandq_u32(cmp, one);
++            });
++        #else
++            using Base = ShiftRegistersBase<NumStreams>;
++            uint32_t cmp[Base::Padded];
++            for (auto i = 0; i < NumStreams; i++)
++                cmp[i] = mag[i] > mag[i + Base::Half];
++            for (auto i = NumStreams; i < Base::Padded; i++)
++                cmp[i] = 0;
++            return shiftInNewBits(cmp);
++        #endif
+         }
+ 
+         constexpr Bits128 extractAlignedFrameLong(auto i) const noexcept {
++        #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++            const uint64_t w0 = this->m_w0[i];
++            const uint64_t w1 = this->m_w1[i];
++            const uint64_t w2 = this->m_w2[i];
++            const uint64_t w3 = this->m_w3[i];
++            // the frame is the register shifted down by 16, cut back into the
++            // two halves Bits128 wants
++            return Bits128((w3 << 16) | (w2 >> 16),
++                           (w1 << 16) | (w0 >> 16) | ((w2 & 0xffffu) << 48));
++        #else
+             return Bits128(this->m_high[i] >> 16, (this->m_low[i] >> 16) | (this->m_high[i] << 48));
++        #endif
+         }
+ 
+         constexpr uint64_t extractAlignedFrameShort(auto i) const noexcept {
++        #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++            return (uint64_t(this->m_w3[i]) << 24) | (this->m_w2[i] >> 8);
++        #else
+             return (this->m_high[i] >> 8);
++        #endif
+         }
+ 
+     private:
++    #if defined(__ARM_NEON) && !defined(STREAM1090_NO_NEON_SHIFTREG)
++        // all ones in the lanes that hold a real stream, zero in the padding
++        static uint32x4_t laneValidMask(int g) noexcept {
++            uint32_t v[4];
++            for (int l = 0; l < 4; l++)
++                v[l] = (4 * g + l < NumStreams) ? ~uint32_t(0) : 0u;
++            return vld1q_u32(v);
++        }
++
++        /// Four streams of the update. getCmp(g) returns the new bit of each
++        /// lane as 0/1.
++        template<typename CmpFn>
++        uint64_t shiftInNewBitsNeon(CmpFn getCmp) noexcept {
++            using Base = ShiftRegistersBase<NumStreams>;
++
++            const uint32x4_t one  = vdupq_n_u32(1u);
++            const uint32x4_t poly = vdupq_n_u32(uint32_t(Polynomial));
++            const uint32x4_t d55  = vdupq_n_u32(uint32_t(Delta55));
++            const uint32x4_t d111 = vdupq_n_u32(uint32_t(Delta111));
++            const uint32x4_t fmts = vdupq_n_u32(handledDownlinkFormats);
++
++            // one bit per lane, the lane's own place in the returned mask
++            uint32x4_t weight = { 1u, 2u, 4u, 8u };
++            uint32x4_t acc = vdupq_n_u32(0u);
++
++            for (int g = 0; g < Base::NumGroups; g++) {
++                const int o = 4 * g;
++                const uint32x4_t cmp = getCmp(g);
++
++                const uint32x4_t w0 = vld1q_u32(this->m_w0 + o);
++                const uint32x4_t w1 = vld1q_u32(this->m_w1 + o);
++                const uint32x4_t w2 = vld1q_u32(this->m_w2 + o);
++                const uint32x4_t w3 = vld1q_u32(this->m_w3 + o);
++                uint32x4_t c56  = vld1q_u32(this->m_crc_56  + o);
++                uint32x4_t c112 = vld1q_u32(this->m_crc_112 + o);
++
++                // carry out of each word, and all ones when a one leaves the
++                // register at the top (arithmetic shift signs the lane)
++                const uint32x4_t k0 = vshrq_n_u32(w0, 31);
++                const uint32x4_t k1 = vshrq_n_u32(w1, 31);
++                const uint32x4_t k2 = vshrq_n_u32(w2, 31);
++                const uint32x4_t shiftOut = vreinterpretq_u32_s32(
++                    vshrq_n_s32(vreinterpretq_s32_u32(w3), 31));
++
++                // vsli shifts the word left and inserts the incoming bit into
++                // the hole that opens at bit zero, so one instruction moves a
++                // whole word where a shift and an or used to be two
++                const uint32x4_t n0 = vsliq_n_u32(cmp, w0, 1);
++                const uint32x4_t n1 = vsliq_n_u32(k0,  w1, 1);
++                const uint32x4_t n2 = vsliq_n_u32(k1,  w2, 1);
++                const uint32x4_t n3 = vsliq_n_u32(k2,  w3, 1);
++
++                // a one leaving the register removes its delayed contribution
++                c56  = veorq_u32(c56,  vandq_u32(d55,  shiftOut));
++                c112 = veorq_u32(c112, vandq_u32(d111, shiftOut));
++
++                // bit 71 feeds the 56 bit crc, bit 15 the 112 bit one
++                c56  = vsliq_n_u32(vandq_u32(vshrq_n_u32(w2, 7),  one), c56,  1);
++                c112 = vsliq_n_u32(vandq_u32(vshrq_n_u32(w0, 15), one), c112, 1);
++
++                // fold the polynomial back in whenever bit 24 is set: the crc
++                // never exceeds 25 bits, so the shift is a 0/1 flag and its
++                // negation is the all ones mask
++                c56  = veorq_u32(c56,  vandq_u32(poly, vreinterpretq_u32_s32(
++                    vnegq_s32(vreinterpretq_s32_u32(vshrq_n_u32(c56,  24))))));
++                c112 = veorq_u32(c112, vandq_u32(poly, vreinterpretq_u32_s32(
++                    vnegq_s32(vreinterpretq_s32_u32(vshrq_n_u32(c112, 24))))));
++
++                // the downlink format is the top five bits of the new register
++                const uint32x4_t df = vshrq_n_u32(n3, 27);
++                // the weight of a lane is its own bit in the mask, so the hit
++                // has to gate it as an all ones mask and not as a 0/1 value
++                const uint32x4_t isHandled =
++                    vceqq_u32(vandq_u32(vshlq_u32(fmts, vnegq_s32(vreinterpretq_s32_u32(df))), one), one);
++                acc = vorrq_u32(acc, vandq_u32(isHandled, weight));
++                weight = vshlq_n_u32(weight, 4);
++
++                vst1q_u32(this->m_w0 + o, n0);
++                vst1q_u32(this->m_w1 + o, n1);
++                vst1q_u32(this->m_w2 + o, n2);
++                vst1q_u32(this->m_w3 + o, n3);
++                vst1q_u32(this->m_crc_56  + o, c56);
++                vst1q_u32(this->m_crc_112 + o, c112);
++            }
++
++            uint32x2_t packed = vorr_u32(vget_low_u32(acc), vget_high_u32(acc));
++            packed = vorr_u32(packed, vext_u32(packed, packed, 1));
++            return uint64_t(vget_lane_u32(packed, 0)) & Base::StreamMask;
++        }
++    #endif
++
+         static constexpr CRC::crc_t Delta55  = CRC::delta<55>();
+         static constexpr CRC::crc_t Delta111 = CRC::delta<111>();
+         static constexpr CRC::crc_t Polynomial = CRC::polynomial;
+--- /dev/null
++++ b/presets/BenchPresets.hpp
+@@ -0,0 +1 @@
++ADD_PRESET(RtlSdr, 2.56, 12)

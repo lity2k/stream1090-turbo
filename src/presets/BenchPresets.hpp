@@ -1,0 +1,1 @@
+ADD_PRESET(RtlSdr, 2.56, 12)

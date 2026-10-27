@@ -1,0 +1,7 @@
+.cache/
+build/
+*.build
+*.o
+stream1090
+stream1090-armv7
+BUILDINFO.tmp

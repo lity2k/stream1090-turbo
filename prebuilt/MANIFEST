@@ -1,0 +1,17 @@
+# prebuilt manifest — read by install.sh
+# key=value, one per line. Do not reorder the md5 line into a comment.
+#
+# version       semantic version of this release
+# built_version identity string embedded in the binary; install.sh compares it
+#               against the string it finds inside the file and aborts on a
+#               mismatch, so this line cannot drift away from the artifact
+version=1.0.2
+built_version=stream1090-turbo 1.0.2.7+22855e3.54fcce7ec665b591d092eed6
+file=stream1090-armv7l-cortexa7
+arch=armv7l
+elf_machine=arm
+presets=BenchPresets.hpp
+preset_params=-s 2.56 -u 12
+upstream_commit=2189bdaca1d62d5e88600b21a281ccc5c18012f2
+md5=cbbe30a1c6f804a29e64304c85983ecc
+size=267944

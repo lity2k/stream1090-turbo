@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.patch text eol=lf
+*.bin binary
+*.png binary
+*.jpg binary
+prebuilt/stream1090-* binary
